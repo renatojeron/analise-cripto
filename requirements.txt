@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+jinja2
+tqdm
+python-binance
+matplotlib
+plotly
