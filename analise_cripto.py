@@ -1,11 +1,14 @@
 import requests
 import pandas as pd
 import concurrent.futures
-from jinja2 import Template
-from tqdm import tqdm
 from datetime import datetime
+import smtplib
+import ssl
+import os
+from email.message import EmailMessage
+from tqdm import tqdm
 
-# Configurações da estratégia
+# Estratégia
 TIMEFRAME = '4h'
 EMA_SHORT = 9
 EMA_LONG = 50
@@ -18,6 +21,23 @@ VOLUME_THRESHOLD = 200000
 VOLA_THRESHOLD = 0.015
 
 STABLECOINS = {"USDT", "BUSD", "USDC", "DAI", "TUSD", "PAX", "GUSD", "UST"}
+
+# Email
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+
+def send_email(subject, body):
+    msg = EmailMessage()
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as smtp:
+        smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        smtp.send_message(msg)
 
 def classify_volume(volume):
     if volume > 50000000:
@@ -81,26 +101,6 @@ def calculate_bollinger_bands(df):
     df['lower_band'] = df['middle_band'] - (df['std_dev'] * 2)
     return df
 
-def calculate_obv(df):
-    df['obv'] = (df['volume'] * ((df['close'] - df['close'].shift(1)) > 0).astype(int)) - (df['volume'] * ((df['close'] - df['close'].shift(1)) < 0).astype(int))
-    df['obv'] = df['obv'].cumsum()
-    return df
-
-def calculate_fibonacci(df):
-    high = df['high'].max()
-    low = df['low'].min()
-    diff = high - low
-    df['fib_0.236'] = high - diff * 0.236
-    df['fib_0.382'] = high - diff * 0.382
-    df['fib_0.5'] = high - diff * 0.5
-    df['fib_0.618'] = high - diff * 0.618
-    df['fib_0.786'] = high - diff * 0.786
-    return df
-
-def check_candlestick_patterns(df):
-    df['hammer'] = (df['close'] > df['open']) & (df['high'] - df['low'] > 3 * (df['open'] - df['close']))
-    return df
-
 def calculate_potential(df):
     last_row = df.iloc[-1]
     upper_band = last_row['upper_band']
@@ -115,9 +115,6 @@ def analyze_pair(pair):
 
     df = calculate_indicators(df)
     df = calculate_bollinger_bands(df)
-    df = calculate_obv(df)
-    df = calculate_fibonacci(df)
-    df = check_candlestick_patterns(df)
 
     df['pct_change'] = df['close'].pct_change()
     last_5_candles_pct = df['pct_change'].tail(5).sum()
@@ -125,139 +122,46 @@ def analyze_pair(pair):
         return None
 
     last_row = df.iloc[-1]
-    trailing_stop = calculate_trailing_stop(last_row['atr'], last_row['volatility'])
 
     if last_row['volatility'] < 0.005:
         return None
 
-    stop_market = max(0.001, round(last_row['close'] - (2 * last_row['atr']), 4))
-
     return {
         'symbol': pair,
         'quote': round(last_row['close'], 4),
-        'stop_market': stop_market,
-        'trailing_stop': trailing_stop,
         'rsi': round(last_row['rsi'], 2),
         'macd': round(last_row['macd'], 4),
         'score': round(last_row['score'], 2),
         'volume': classify_volume(last_row['volume']),
         'potential': round(calculate_potential(df), 2),
-        'ema_condition': last_row['ema_short'] > last_row['ema_long'],
-        'rsi_condition': last_row['rsi'] < 50,
-        'macd_condition': last_row['macd'] > 0,
-        'volatility_condition': last_row['volatility'] < VOLA_THRESHOLD
     }
 
 def find_opportunities():
     pairs = get_all_usdt_pairs()
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        results = list(tqdm(executor.map(analyze_pair, pairs), total=len(pairs), desc="Analisando Mercados"))
-    return sorted([trade for trade in results if trade], key=lambda x: x['score'], reverse=True)[:25]
+        results = list(tqdm(executor.map(analyze_pair, pairs), total=len(pairs), desc="Analisando"))
+    return [r for r in results if r]
 
-def select_best_opportunity(trades):
-    best_trade = None
-    highest_potential = 0
-    for trade in trades:
-        if 10 <= trade['potential'] <= 30 and trade['potential'] > highest_potential:
-            highest_potential = trade['potential']
-            best_trade = trade
-    return best_trade
+def main():
+    print(f"\n⏳ Rodando análise às {datetime.now().strftime('%H:%M:%S')}...")
+    trades = find_opportunities()
+    for t in trades:
+        if t['score'] >= 5:
+            subject = f"Oportunidade: {t['symbol']} com Score {t['score']}"
+            body = f"""
+🕒 Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🔍 Par: {t['symbol']}
+📈 Cotação: {t['quote']}
+⭐ Score: {t['score']}
+📊 RSI: {t['rsi']}
+📉 MACD: {t['macd']}
+💥 Potencial: {t['potential']}%
+📦 Volume: {t['volume']}
+"""
+            send_email(subject, body)
+            print(f"✅ E-mail enviado para {EMAIL_RECEIVER} sobre {t['symbol']}")
+        else:
+            print(f"🔸 {t['symbol']} - Score {t['score']}")
 
-def generate_best_trade_html(best_trade):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    take_profit = round(best_trade['quote'] * (1 + best_trade['potential'] / 100), 4)
-    stop_loss = best_trade['stop_market']
-    score_str = f"{best_trade['score']} de 6.0"
-
-    def icon(val):
-        return "✅" if val else "❌"
-
-    html_template = """
-    <!DOCTYPE html>
-    <html lang=\"pt-br\">
-    <head>
-        <meta charset=\"UTF-8\">
-        <title>Melhor Oportunidade de Trade</title>
-        <style>
-            body {
-                background: linear-gradient(to right, #0f2027, #203a43, #2c5364);
-                color: #f0f0f0;
-                font-family: 'Segoe UI', sans-serif;
-                padding: 40px;
-            }
-            .container {
-                background-color: rgba(255, 255, 255, 0.05);
-                padding: 30px;
-                border-radius: 20px;
-                box-shadow: 0 0 20px rgba(0,255,255,0.2);
-                max-width: 700px;
-                margin: auto;
-            }
-            h1, h2 {
-                color: #00ffff;
-                text-align: center;
-            }
-            .info {
-                font-size: 18px;
-                margin-bottom: 12px;
-            }
-            .badge {
-                display: inline-block;
-                padding: 8px 15px;
-                border-radius: 12px;
-                background-color: #00ffff;
-                color: #000;
-                margin: 10px 0;
-                font-weight: bold;
-            }
-            .footer {
-                text-align: center;
-                margin-top: 25px;
-                font-size: 14px;
-                color: #aaa;
-            }
-        </style>
-    </head>
-    <body>
-        <div class=\"container\">
-            <h1>🚀 Melhor Oportunidade de Trade</h1>
-            <h2>{{ best_trade.symbol }}</h2>
-
-            <p class=\"info\">📉 <strong>Cotação Atual:</strong> R$ {{ best_trade.quote }}</p>
-            <p class=\"info\">📈 <strong>Potencial de Valorização:</strong> {{ best_trade.potential }}%</p>
-            <p class=\"info\">📊 <strong>RSI:</strong> {{ best_trade.rsi }}</p>
-            <p class=\"info\">📉 <strong>MACD:</strong> {{ best_trade.macd }}</p>
-            <p class=\"info\">🔥 <strong>Volume:</strong> {{ best_trade.volume }}</p>
-            <p class=\"info\">🧠 <strong>Score:</strong> {{ score_str }}</p>
-            <p class=\"info\">RSI < 50: {{ icon(best_trade.rsi_condition) }}</p>
-            <p class=\"info\">EMA 9 > EMA 50: {{ icon(best_trade.ema_condition) }}</p>
-            <p class=\"info\">Volatilidade < 1.5%: {{ icon(best_trade.volatility_condition) }}</p>
-            <p class=\"info\">MACD > 0: {{ icon(best_trade.macd_condition) }}</p>
-
-            <p class=\"info badge\">🎯 Sugestão de venda para lucro: R$ {{ take_profit }}</p>
-            <p class=\"info badge\">🚩 Stop Loss sugerido: R$ {{ stop_loss }}</p>
-
-            <div class=\"footer\">Última atualização: {{ now }}</div>
-        </div>
-    </body>
-    </html>
-    """
-    with open("melhor_oportunidade_trade.html", "w", encoding="utf-8") as f:
-        f.write(Template(html_template).render(
-            best_trade=best_trade,
-            now=now,
-            score_str=score_str,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            icon=icon
-        ))
-    print("\u2705 Relatório HTML gerado com sucesso!")
-
-# Executar análise
-trades = find_opportunities()
-best_trade = select_best_opportunity(trades)
-if best_trade:
-    generate_best_trade_html(best_trade)
-else:
-    print("\u274c Nenhuma oportunidade encontrada dentro dos critérios.")
+if __name__ == "__main__":
+    main()
